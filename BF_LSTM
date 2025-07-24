@@ -1,0 +1,242 @@
+function BF_LSTM()
+clc; close all; rng(2024);
+
+totalSamples   = 1000;
+sequenceLength = 10;
+numAntennas    = 4;
+verbosePlot    = true;
+
+carrierFrequency = 28e9;
+systemBandwidth  = 400e6;
+txPower          = 1e-3;
+refDistance      = 10;
+userSpeed        = 5;
+
+k_B  = 1.38064852e-23; Temp = 290; B = systemBandwidth;
+noisePower = k_B * Temp * B;
+
+fprintf('--- 5G Parameter Samples ---\n');
+fprintf('  Carrier Frequency: %.2f GHz\n', carrierFrequency/1e9);
+fprintf('  System Bandwidth:  %.2f MHz\n', systemBandwidth/1e6);
+fprintf('  Noise Power (kTB): %.2e W\n', noisePower);
+fprintf('  User Speed:        %d m/s\n', userSpeed);
+fprintf('  Transmit Power:    %.1f mW\n', txPower*1000);
+fprintf('---------------------------------\n\n');
+
+[inputData, targetData, csiAll] = generateSyntheticData(totalSamples, numAntennas, carrierFrequency);
+
+splitIdx = floor(0.8*totalSamples);
+trainIdx = 1:splitIdx;
+valIdx   = splitIdx+1:totalSamples;
+
+[~, muFeat, stdFeat] = normalizeFeaturesTrain(inputData(:,trainIdx));
+inputDataAllNorm = normalizeFeaturesApply(inputData, muFeat, stdFeat);
+
+[XTrain, YTrain, XVal, YVal, ~, ~] = prepareLstmSequences_TimeStepped(inputDataAllNorm, targetData, csiAll, sequenceLength, trainIdx, valIdx);
+
+XTrainCell = squeeze(num2cell(XTrain, [1,2]));
+YTrainCell = squeeze(num2cell(YTrain, [1,2]));
+XValCell   = squeeze(num2cell(XVal,   [1,2]));
+YValCell   = squeeze(num2cell(YVal,   [1,2]));
+
+fprintf('Number of Training Sequences: %d\n', numel(XTrainCell));
+fprintf('One sample XTrainCell shape: [%d x %d]\n', size(XTrainCell{1},1), size(XTrainCell{1},2));
+fprintf('One sample YTrainCell shape: [%d x %d]\n', size(YTrainCell{1},1), size(YTrainCell{1},2));
+
+inputFeatureDim = size(inputDataAllNorm,1);
+layers  = createLstmNetwork_TimeStepped(inputFeatureDim, numAntennas);
+options = defineTrainingOptions_TimeStepped(XValCell, YValCell);
+
+fprintf('\n>>> Starting LSTM Training (time-stepped outputs)...\n');
+net = trainNetwork(XTrainCell, YTrainCell, layers, options);
+fprintf('>>> Training Completed.\n');
+
+[newInputRaw, csiTest, trueBF] = generateNewUserData(sequenceLength, numAntennas, carrierFrequency);
+newInputData = normalizeFeaturesApply(newInputRaw, muFeat, stdFeat);
+predictedBF  = predictBeamformingVector_TimeStepped(net, newInputData, numAntennas);
+
+[MSE_val, SNR_val, spectralEff, channelCap] = evaluatePerformance_TimeStepped(trueBF, predictedBF, csiTest, noisePower, systemBandwidth, txPower, refDistance, carrierFrequency);
+
+fprintf('\n>>> PERFORMANCE METRICS (Time-Stepped) <<<\n');
+fprintf('  1) MSE (complex):               %.6f\n', MSE_val);
+fprintf('  2) SNR (dB):                    %.2f\n', SNR_val);
+fprintf('  3) Spectral Efficiency (bps/Hz):%.2f\n', spectralEff);
+fprintf('  4) Channel Capacity (Mbps):     %.2f\n\n', channelCap/1e6);
+
+if verbosePlot
+    plotResults_TimeStepped(trueBF, predictedBF);
+    plotBeamPattern(predictedBF(:,1));
+end
+end
+
+function [inputData, targetData, csiAll] = generateSyntheticData(totalSamples, numAntennas, carrierFrequency)
+userLocations = 50*rand(3,totalSamples) - 25;
+signalQuality = -20 + 15*rand(1,totalSamples);
+channelStateInfo = zeros(12,totalSamples);
+csiAll = zeros(numAntennas,totalSamples);
+for t = 1:totalSamples
+    h = generateRealisticCSI(numAntennas, carrierFrequency, userLocations(:,t));
+    csiAll(:,t) = h;
+    channelStateInfo(1:4, t) = abs(h);
+    channelStateInfo(5:8, t) = angle(h);
+    channelStateInfo(9,  t) = mean(abs(h));
+    channelStateInfo(10, t) = std(abs(h));
+    channelStateInfo(11, t) = mean(angle(h));
+    channelStateInfo(12, t) = std(angle(h));
+end
+interferenceLevels = -80 + 20*rand(4,totalSamples);
+inputData = [userLocations; signalQuality; channelStateInfo; interferenceLevels];
+norms = vecnorm(csiAll,2,1); norms(norms==0)=1;
+beamformingVectors = conj(csiAll) ./ norms;
+targetData = [real(beamformingVectors); imag(beamformingVectors)];
+end
+
+function h = generateRealisticCSI(numAntennas, carrierFreq, userPos)
+numPaths = 3; lambda = 3e8/carrierFreq; d = lambda/2;
+baseAz = atan2d(userPos(2), userPos(1)); spread = 10;
+aoas = baseAz + spread*(rand(numPaths,1)-0.5);
+pg = exp(-0.5*(0:numPaths-1)).'; pg = pg./norm(pg);
+pg = pg .* ((randn(numPaths,1)+1j*randn(numPaths,1))/sqrt(2));
+h = zeros(numAntennas,1);
+for p = 1:numPaths
+    a = exp(-1j*2*pi*d/lambda * sind(aoas(p)) * (0:numAntennas-1)');
+    h = h + pg(p)*a;
+end
+h = h / sqrt(mean(abs(h).^2));
+end
+
+function [XTrain, YTrain, XVal, YVal, csiTrainSeq, csiValSeq] = prepareLstmSequences_TimeStepped(dataNorm, targetData, csiAll, seqLen, trainIdx, valIdx)
+[XTrain,YTrain,csiTrainSeq] = makeSeq(dataNorm, targetData, csiAll, seqLen, trainIdx);
+[XVal,  YVal,  csiValSeq]   = makeSeq(dataNorm, targetData, csiAll, seqLen, valIdx);
+end
+
+function [X,Y,C] = makeSeq(dataNorm, targetData, csiAll, seqLen, idxRange)
+numObs = numel(idxRange);
+nSeq   = numObs - seqLen + 1;
+nf = size(dataNorm,1); nb = size(targetData,1); na = size(csiAll,1);
+X = zeros(nf, seqLen, nSeq);
+Y = zeros(nb, seqLen, nSeq);
+C = zeros(na, seqLen, nSeq);
+for k = 1:nSeq
+    idxBlock = idxRange(k):idxRange(k)+seqLen-1;
+    X(:,:,k) = dataNorm(:, idxBlock);
+    Y(:,:,k) = targetData(:, idxBlock);
+    C(:,:,k) = csiAll(:, idxBlock);
+end
+end
+
+function [dataNorm, muFeat, stdFeat] = normalizeFeaturesTrain(data)
+muFeat  = mean(data,2);
+stdFeat = std(data,0,2);
+stdFeat(stdFeat<1e-6) = 1;
+dataNorm = (data - muFeat) ./ stdFeat;
+end
+
+function dataOut = normalizeFeaturesApply(dataIn, muFeat, stdFeat)
+dataOut = (dataIn - muFeat) ./ stdFeat;
+end
+
+function layers = createLstmNetwork_TimeStepped(inputFeatureDim, numAntennas)
+outputDim = 2*numAntennas;
+layers = [
+    sequenceInputLayer(inputFeatureDim,'Name','Input')
+    lstmLayer(64,'OutputMode','sequence','Name','LSTM_1')
+    dropoutLayer(0.2,'Name','Drop1')
+    lstmLayer(32,'OutputMode','sequence','Name','LSTM_2')
+    dropoutLayer(0.2,'Name','Drop2')
+    fullyConnectedLayer(outputDim,'Name','FC')
+    regressionLayer('Name','RegOut')
+];
+end
+
+function options = defineTrainingOptions_TimeStepped(XValCell, YValCell)
+options = trainingOptions('adam', ...
+    'MaxEpochs',           50, ...
+    'GradientThreshold',    1, ...
+    'InitialLearnRate',  0.005, ...
+    'MiniBatchSize',        32, ...
+    'Shuffle',      'every-epoch', ...
+    'ValidationData', {XValCell, YValCell}, ...
+    'ValidationFrequency', 50, ...
+    'ValidationPatience',   5, ...
+    'Plots',   'training-progress', ...
+    'Verbose',            true);
+end
+
+function [newInputData, csiSeq, trueBF] = generateNewUserData(seqLen, numAntennas, carrierFreq)
+userLoc = 50*rand(3,seqLen) - 25;
+sigQ    = -20 + 15*rand(1,seqLen);
+csiSeq  = zeros(numAntennas, seqLen);
+csiFeat = zeros(12, seqLen);
+for t = 1:seqLen
+    h = generateRealisticCSI(numAntennas, carrierFreq, userLoc(:,t));
+    csiSeq(:,t) = h;
+    csiFeat(1:4,t)  = abs(h);
+    csiFeat(5:8,t)  = angle(h);
+    csiFeat(9,t)    = mean(abs(h));
+    csiFeat(10,t)   = std(abs(h));
+    csiFeat(11,t)   = mean(angle(h));
+    csiFeat(12,t)   = std(angle(h));
+end
+interf = -80 + 20*rand(4,seqLen);
+newInputData = [userLoc; sigQ; csiFeat; interf];
+norms = vecnorm(csiSeq,2,1); norms(norms==0)=1;
+trueBF = conj(csiSeq) ./ norms;
+end
+
+function predictedBF = predictBeamformingVector_TimeStepped(net, newInputData, numAntennas)
+raw = predict(net, {newInputData}); raw = raw{1};
+realP = raw(1:numAntennas,:); imagP = raw(numAntennas+1:end,:);
+predictedBF = complex(realP, imagP);
+for t = 1:size(predictedBF,2)
+    nrm = norm(predictedBF(:,t)); if nrm>0, predictedBF(:,t)=predictedBF(:,t)/nrm; end
+end
+end
+
+function [MSE_val, SNR_dB, spectralEfficiency, channelCapacity] = evaluatePerformance_TimeStepped(trueBF, predictedBF, csiSeq, noisePower, systemBandwidth, txPower, refDistance, carrierFreq)
+MSE_val = mean(abs(predictedBF(:) - trueBF(:)).^2);
+lambda = 3e8/carrierFreq;
+FSPL_dB = 20*log10(4*pi*refDistance/lambda);
+PL_lin = 10^(-FSPL_dB/10);
+L = size(predictedBF,2); rxP = zeros(1,L);
+for t = 1:L
+    gain = abs(csiSeq(:,t)' * predictedBF(:,t))^2;
+    rxP(t) = txPower * PL_lin * gain;
+end
+SNR_lin = mean(rxP)/noisePower; SNR_dB = 10*log10(SNR_lin);
+spectralEfficiency = log2(1 + SNR_lin);
+channelCapacity = systemBandwidth * spectralEfficiency;
+end
+
+function plotResults_TimeStepped(trueBF, predictedBF)
+numAnt = size(trueBF,1); L = size(trueBF,2);
+figure('Name','Time-Stepped Beamforming','Color',[1 1 1],'Position',[100,100,900,600]);
+for a = 1:numAnt
+    subplot(numAnt,2,2*a-1);
+    plot(1:L, abs(trueBF(a,:)),'g-o','LineWidth',1.2); hold on;
+    plot(1:L, abs(predictedBF(a,:)),'r--*','LineWidth',1.2); grid on;
+    legend('True','Pred','Location','best');
+    title(sprintf('Antenna %d: Magnitude',a)); xlabel('t'); ylabel('|w|');
+    subplot(numAnt,2,2*a);
+    plot(1:L, unwrap(angle(trueBF(a,:))),'g-o','LineWidth',1.2); hold on;
+    plot(1:L, unwrap(angle(predictedBF(a,:))),'b--*','LineWidth',1.2); grid on;
+    legend('True','Pred','Location','best');
+    title(sprintf('Antenna %d: Phase',a)); xlabel('t'); ylabel('Phase (rad)');
+end
+sgtitle('Beamforming Vectors: True vs Predicted (Time-Stepped)');
+end
+
+function plotBeamPattern(beamformingVector)
+numAnt = numel(beamformingVector);
+angles = -90:0.5:90; pat = zeros(size(angles));
+for k = 1:numel(angles)
+    a = exp(-1j*pi*sind(angles(k))*(0:numAnt-1)');
+    pat(k) = abs(beamformingVector'*a)^2;
+end
+pat_dB = 10*log10(pat/max(pat));
+figure('Name','Beam Pattern','Color',[1 1 1]);
+plot(angles, pat_dB, 'b-','LineWidth',2); grid on; ylim([-40 0]);
+xlabel('Angle (deg)'); ylabel('Normalized Gain (dB)'); title('Beamforming Pattern');
+[mx,ix] = max(pat_dB); hold on; plot(angles(ix),mx,'ro','MarkerSize',8,'LineWidth',2);
+text(angles(ix), mx+2, sprintf('Main Lobe\n%.1f°', angles(ix)), 'HorizontalAlignment','center');
+end
