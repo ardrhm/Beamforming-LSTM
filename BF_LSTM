@@ -6,7 +6,7 @@ function results = BF_LSTM()
     noisePower = computeNoisePower(P.k_B, P.Temp, P.systemBandwidth);
     displayParameters(P, noisePower);
 
-    [inputData, targetData, csiAll] = generateSyntheticData(P.totalSamples, P.numAntennas, P.carrierFrequency);
+    [inputData, targetData, csiAll] = generateSyntheticData(P);
     [trainIdx, valIdx] = splitData(P.totalSamples, P.trainFraction);
 
     [~, muFeat, stdFeat] = normalizeFeaturesTrain(inputData(:,trainIdx));
@@ -22,7 +22,7 @@ function results = BF_LSTM()
 
     net = trainNetwork(XTrainCell, YTrainCell, layers, options);
 
-    [newInputRaw, csiTest, trueBF] = generateNewUserData(P.sequenceLength, P.numAntennas, P.carrierFrequency);
+    [newInputRaw, csiTest, trueBF] = generateNewUserData(P);
     newInputData = normalizeFeaturesApply(newInputRaw, muFeat, stdFeat);
     predictedBF  = predictBeamformingVector(net, newInputData, P.numAntennas);
 
@@ -46,19 +46,20 @@ function results = BF_LSTM()
 end
 
 function P = getDefaultParams()
-    P.totalSamples    = 1000;
-    P.sequenceLength  = 10;
-    P.numAntennas     = 4;
-    P.verbosePlot     = true;
-    P.carrierFrequency= 28e9;
-    P.systemBandwidth = 400e6;
-    P.txPower         = 1e-3;
-    P.refDistance     = 10;
-    P.userSpeed       = 5;
-    P.k_B             = 1.38064852e-23;
-    P.Temp            = 290;
-    P.trainFraction   = 0.8;
-    P.seed            = 2024;
+    P.totalSamples     = 1000;
+    P.sequenceLength   = 10;
+    P.numAntennas      = 4;
+    P.verbosePlot      = true;
+    P.carrierFrequency = 28e9;
+    P.systemBandwidth  = 400e6;
+    P.txPower          = 1e-3;
+    P.refDistance      = 10;
+    P.userSpeed        = 5;            % m/s
+    P.sampleInterval   = 1e-3;         % seconds between CSI updates
+    P.k_B              = 1.38064852e-23;
+    P.Temp             = 290;
+    P.trainFraction    = 0.8;
+    P.seed             = 2024;
 end
 
 function noisePower = computeNoisePower(k_B, Temp, B)
@@ -71,18 +72,37 @@ function displayParameters(P, noisePower)
     fprintf('  System Bandwidth:  %.2f MHz\n', P.systemBandwidth/1e6);
     fprintf('  Noise Power (kTB): %.2e W\n', noisePower);
     fprintf('  User Speed:        %d m/s\n', P.userSpeed);
+    fprintf('  CSI Interval:      %.1f ms\n', P.sampleInterval*1e3);
     fprintf('  Transmit Power:    %.1f mW\n', P.txPower*1000);
     fprintf('---------------------------------\n\n');
 end
 
-function [inputData, targetData, csiAll] = generateSyntheticData(totalSamples, numAntennas, carrierFreq)
+function [inputData, targetData, csiAll] = generateSyntheticData(P)
+    totalSamples   = P.totalSamples;
+    numAntennas    = P.numAntennas;
+    carrierFreq    = P.carrierFrequency;
+    v              = P.userSpeed;
+    Ts             = P.sampleInterval;
+
+    lambda = 3e8/carrierFreq;
+    fD_max = v / lambda;
+    rho    = besselj(0, 2*pi*fD_max*Ts);
+
     userLoc       = 50*rand(3,totalSamples) - 25;
     signalQuality = -20 + 15*rand(1,totalSamples);
-    csiAll        = zeros(numAntennas,totalSamples);
-    channelFeat   = zeros(12,totalSamples);
+    interfLevels  = -80 + 20*rand(4,totalSamples);
+
+    csiAll    = zeros(numAntennas,totalSamples);
+    channelFeat = zeros(12,totalSamples);
+
     for t = 1:totalSamples
-        h = generateRealisticCSI(numAntennas, carrierFreq, userLoc(:,t));
-        csiAll(:,t) = h;
+        if t == 1
+            h = generateRealisticCSI(numAntennas, carrierFreq, userLoc(:,t));
+        else
+            eps_h = generateRealisticCSI(numAntennas, carrierFreq, userLoc(:,t));
+            h = rho * h + sqrt(1-rho^2) * eps_h;
+        end
+        csiAll(:,t)    = h;
         channelFeat(1:4, t)  = abs(h);
         channelFeat(5:8, t)  = angle(h);
         channelFeat(9,   t)  = mean(abs(h));
@@ -90,11 +110,11 @@ function [inputData, targetData, csiAll] = generateSyntheticData(totalSamples, n
         channelFeat(11,  t)  = mean(angle(h));
         channelFeat(12,  t)  = std(angle(h));
     end
-    interfLevels = -80 + 20*rand(4,totalSamples);
-    inputData    = [userLoc; signalQuality; channelFeat; interfLevels];
-    norms        = vecnorm(csiAll,2,1); norms(norms==0)=1;
-    bfVecs       = conj(csiAll) ./ norms;
-    targetData   = [real(bfVecs); imag(bfVecs)];
+
+    inputData  = [userLoc; signalQuality; channelFeat; interfLevels];
+    norms      = vecnorm(csiAll,2,1); norms(norms==0)=1;
+    bfVecs     = conj(csiAll) ./ norms;
+    targetData = [real(bfVecs); imag(bfVecs)];
 end
 
 function [trainIdx, valIdx] = splitData(totalSamples, frac)
@@ -167,23 +187,41 @@ function options = defineTrainingOptions(XVal, YVal)
         'Verbose',            true);
 end
 
-function [newInput, csiSeq, trueBF] = generateNewUserData(seqLen, numAnt, carrierFreq)
+function [newInput, csiSeq, trueBF] = generateNewUserData(P)
+    seqLen     = P.sequenceLength;
+    numAntennas= P.numAntennas;
+    carrierFreq= P.carrierFrequency;
+    v          = P.userSpeed;
+    Ts         = P.sampleInterval;
+
+    lambda = 3e8/carrierFreq;
+    fD_max = v / lambda;
+    rho    = besselj(0, 2*pi*fD_max*Ts);
+
     userLoc = 50*rand(3,seqLen) - 25;
     sigQ    = -20 + 15*rand(1,seqLen);
-    csiSeq  = zeros(numAnt,seqLen);
-    cFeat   = zeros(12,seqLen);
+    interf  = -80 + 20*rand(4,seqLen);
+
+    csiSeq = zeros(numAntennas,seqLen);
+    channelFeat = zeros(12,seqLen);
+
     for t = 1:seqLen
-        h = generateRealisticCSI(numAnt, carrierFreq, userLoc(:,t));
-        csiSeq(:,t) = h;
-        cFeat(1:4, t) = abs(h);
-        cFeat(5:8, t) = angle(h);
-        cFeat(9,   t) = mean(abs(h));
-        cFeat(10,  t) = std(abs(h));
-        cFeat(11,  t) = mean(angle(h));
-        cFeat(12,  t) = std(angle(h));
+        if t == 1
+            h = generateRealisticCSI(numAntennas, carrierFreq, userLoc(:,t));
+        else
+            eps_h = generateRealisticCSI(numAntennas, carrierFreq, userLoc(:,t));
+            h = rho * h + sqrt(1-rho^2) * eps_h;
+        end
+        csiSeq(:,t)       = h;
+        channelFeat(1:4,t)= abs(h);
+        channelFeat(5:8,t)= angle(h);
+        channelFeat(9,t)  = mean(abs(h));
+        channelFeat(10,t) = std(abs(h));
+        channelFeat(11,t) = mean(angle(h));
+        channelFeat(12,t) = std(angle(h));
     end
-    interf = -80 + 20*rand(4,seqLen);
-    newInput = [userLoc; sigQ; cFeat; interf];
+
+    newInput = [userLoc; sigQ; channelFeat; interf];
     norms    = vecnorm(csiSeq,2,1); norms(norms==0)=1;
     trueBF   = conj(csiSeq) ./ norms;
 end
@@ -211,10 +249,10 @@ function [MSE_val, SNR_dB, spectralEff, channelCap] = ...
         gain   = abs(csiSeq(:,t)' * predBF(:,t))^2;
         rxP(t) = txPower * PL_lin * gain;
     end
-    SNR_lin   = mean(rxP)/noisePower;
-    SNR_dB    = 10*log10(SNR_lin);
-    spectralEff   = log2(1+SNR_lin);
-    channelCap    = B * spectralEff;
+    SNR_lin      = mean(rxP)/noisePower;
+    SNR_dB       = 10*log10(SNR_lin);
+    spectralEff  = log2(1+SNR_lin);
+    channelCap   = B * spectralEff;
 end
 
 function displayPerformance(MSE_val, SNR_dB, spectralEff, channelCap)
