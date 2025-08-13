@@ -1,1 +1,1 @@
-Time‑Stepped LSTM for 5G/mmWave Beamforming Vector Prediction
+Learning Complex Beamforming Under Negative Temporal Correlation Using LSTM
